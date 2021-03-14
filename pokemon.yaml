@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Stack for creating pokedex datalake
+Parameters:
+  BucketName:
+    Description: The name of the bucket you want to create to store the pokemon data (your pokedex)
+    Type: String
+  DBName:
+    Description: The name of the Database that glue table schemas will be saved under
+    Type: String
+    Default: mypokemondb
+  GlueServicePolicyArn:
+    Description: The arn for the aws glue service role
+    Type: String
+    Default: arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+Outputs:
+  StackID:
+    Description: ARN of the cloudformation stack
+    Value: !Ref "AWS::StackId"
+    Export:
+      Name: !Sub "${AWS::StackName}-StackID"
+  StackRegion:
+    Description: Region of the cloudformation stack
+    Value: !Ref "AWS::Region"
+  Pokedex:
+    Description: Reference name for bucket where pokemon data is be stored.
+    Value: !Ref Pokedex
+  PokedexARN:
+    Description: ARN for the pokedex (i.e. the bucket where pokemon data is stored)
+    Value: !GetAtt Pokedex.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-PokedexARN"
+Resources:
+  Pokedex:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: project
+          Value: pokemon
+        - Key: stack
+          Value: pokemon-stack
+  PokemonGlueRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - Ref: GlueServicePolicyArn
+      RoleName: glue-pokemon-assume-role
+  PokemonGluePolicy:
+    Type: AWS::IAM::Policy
+    DependsOn:
+      - PokemonGlueRole
+      - Pokedex
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt Pokedex.Arn
+                  - /rawjson/*
+          - Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:DeleteObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt Pokedex.Arn
+                  - /parquetdata/*
+              - !Join
+                - ''
+                - - !GetAtt Pokedex.Arn
+                  - /gluetempdir/*
+          - Action:
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt Pokedex.Arn
+                  - '/*'
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Join
+                - ''
+                - - !GetAtt Pokedex.Arn
+                  - /gluescript/*
+          - Action:
+              - cloudformation:DescribeStacks
+            Effect: Allow
+            Resource:
+              Ref: AWS::StackId
+        Version: 2012-10-17
+      PolicyName: pokemonglue-policy
+      Roles:
+        - Ref: PokemonGlueRole
+  PokemonJSONCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - Pokedex
+      - PokemonGlueRole
+    Properties:
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+      DatabaseName: !Ref DBName
+      Description: crawls the s3 bucket for raw json of pokemon
+      Name: JSONPokedexCrawler
+      Role: !GetAtt PokemonGlueRole.Arn
+      Targets:
+        S3Targets:
+          - Path:
+              !Join
+              - ''
+              - - s3://
+                - !Ref Pokedex
+                - /rawjson/
+  PokemonParquetCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn:
+      - Pokedex
+      - PokemonGlueRole
+    Properties:
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+      DatabaseName: !Ref DBName
+      Description: crawls the s3 bucket for parquet data of pokemon
+      Name: ParquetPokedexCrawler
+      Role: !GetAtt PokemonGlueRole.Arn
+      Targets:
+        S3Targets:
+          - Path:
+              !Join
+              - ''
+              - - s3://
+                - !Ref Pokedex
+                - /parquetdata/
+  PokemonParquetJob:
+    Type: AWS::Glue::Job
+    DependsOn:
+      - Pokedex
+      - PokemonGlueRole
+    Properties:
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+      Command:
+        Name: glueetl
+        ScriptLocation:
+          !Join
+          - ''
+          - - s3://
+            - !Ref Pokedex
+            - /gluescript/pokemon_to_parquet.py
+      GlueVersion: 2.0
+      NumberOfWorkers: 1
+      WorkerType: Standard
+      Timeout: 10
+      DefaultArguments:
+        "--job-bookmark-option": "job-bookmark-enable"
+        "--cfstackname": !Ref "AWS::StackName"
+        "--region_name": !Ref "AWS::Region"
+        "--bucket_name": !Ref Pokedex
+        "--database" : !Ref PokemonGlueDB
+        "--TempDir":
+          !Join
+          - ''
+          - - s3://
+            - !Ref Pokedex
+            - /gluetempdir/
+      ExecutionProperty:
+        MaxConcurrentRuns: 1
+      MaxRetries: 0
+      Name: PokemonToParquetJob
+      Role: !GetAtt PokemonGlueRole.Arn
+  PokemonGlueDB:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Description: Database for the pokedex information
+        Name: !Ref DBName
+  PokemonGlueWorkflow:
+    Type: AWS::Glue::Workflow
+    Properties:
+      Description: Workflow to crawl pokemon jsons and convert to parquet
+      Name: PokemonWorkflow
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+  PokemonGlueTriggerStart:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - CrawlerName: !Ref PokemonJSONCrawler
+      Description: Starts the pokemon glue workflow by crawling jsons
+      Name: PokemonStart
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+      Type: ON_DEMAND
+      WorkflowName: !Ref PokemonGlueWorkflow
+  PokemonGlueTrigger1:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - JobName: !Ref PokemonParquetJob
+      Description: Starts the pokemon glue parquet job
+      Name: PokemonParquetJobStart
+      StartOnCreation: True
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+      Type: CONDITIONAL
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            CrawlerName: !Ref PokemonJSONCrawler
+            CrawlState: SUCCEEDED
+      WorkflowName: !Ref PokemonGlueWorkflow
+  PokemonGlueTrigger2:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Actions:
+        - CrawlerName: !Ref PokemonParquetCrawler
+      Description: Final step to crawl the parquet files for schema info
+      Name: PokemonParquetCrawlStart
+      StartOnCreation: True
+      Tags:
+        project: pokemon
+        stack: pokemon-stack
+      Type: CONDITIONAL
+      Predicate:
+        Logical: AND
+        Conditions:
+          - LogicalOperator: EQUALS
+            JobName: !Ref PokemonParquetJob
+            State: SUCCEEDED
+      WorkflowName: !Ref PokemonGlueWorkflow
